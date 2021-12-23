@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  # Added labels for better use selector when need search any kubernetes object
+  labels:
+    app.kubernetes.io/instance: web-iis
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: web-api
+    app.kubernetes.io/version: 7.10.0
+    helm.sh/chart: web-api-0.1.0
+    env: prod
+  name: web-iis
+  # Use separate namespace for each environment
+  namespace: prod
+spec:
+  # Use 2 replicas for minimum HA mode
+  replicas: 2
+  # Use revisionHistoryLimit for store information about changes
+  revisionHistoryLimit: 20
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: web-iis
+      app.kubernetes.io/name: web-api
+      env: prod
+  strategy:
+  # When running rollingUpdate first of all create one more pod with new version, pass readinessProbe, and only after that remove old one pod. Not so fast but stable.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: web-iis
+        app.kubernetes.io/name: web-api
+        env: prod
+    spec:
+      affinity:
+        # Use nodeAffinity to distribute pod creation between all of our availability zones
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - preference:
+              matchExpressions:
+              - key: failure-domain.beta.kubernetes.io/zone
+                operator: In
+                values:
+                - ap-southeast-1a
+                - ap-southeast-1b
+                - ap-southeast-1c
+            weight: 1
+        podAntiAffinity:
+          # Use podAntiAffinity for prevent to run 2 pods of same application on one node.
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/instance
+                  operator: In
+                  values:
+                  - web-iis
+              topologyKey: kubernetes.io/hostname
+            weight: 2
+      containers:
+      - env:
+        - name: dbserver
+          value: sql-api
+        - name: database
+          value: api
+          # "Safe" passing credentianls for pod
+        - name: dbuser
+          valueFrom:
+            secretKeyRef:
+              key: user
+              name: secret-sql-api
+        - name: dbpassword
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: secret-sql-api
+        image: mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2019
+        imagePullPolicy: IfNotPresent
+        # preStop command used for correct shutdown your application and not hard reset your current connections.
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - iisreset
+              - /stop
+              - /noforce
+        name: web-iis
+        ports:
+        - containerPort: 80
+          name: http
+          protocol: TCP
+        - containerPort: 9101
+          name: metrics
+          protocol: TCP
+        # readinessProbe used for prepare your pod when running, do not allow to pass traffic to pod. which is not ready to serve it.
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /Ping
+            port: 80
+            scheme: HTTP
+          initialDelaySeconds: 7
+          periodSeconds: 3
+          successThreshold: 2
+          timeoutSeconds: 5
+        resources:
+         # Use requests and limits for better fill capcity of your nodes.
+         # Better to set limits after audit your application via VPA.
+         limits:
+           cpu: "500"
+           memory: 512Mi
+          requests:
+            # I am setting 200m, becasue at startup we need more that 100mi, if capacity > 100m will not available, our application can be slow.
+            cpu: 200m
+            memory: 128Mi
+      # Nodeselector also used, because we are running windows container
+      nodeSelector:
+        beta.kubernetes.io/os: windows
+      # Terminanion period also used for allow your application completed correctly currents tasks.
+      terminationGracePeriodSeconds: 60
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hpa-web-iis
+  namespace: prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-iis
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        # 80% of 200m of cpu give us enoght time to scale before our application will be slow.
+        averageUtilization: 80
+
+---
+#  I will be add VerticalPodAutoscaler in audit mode only just for better understand which limits and requests we need for our application.
+apiVersion: autoscaling.k8s.io/v1beta2
+kind: VerticalPodAutoscaler
+metadata:
+  name: vpa-web-iis
+  namespace: prod
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind:       Deployment
+    name:       web-iis
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: web-iis
+      minAllowed:
+        cpu: "100m"
+        memory: "128Mi"
+      maxAllowed:
+        cpu: "2"
+        memory: "4Gi"
